@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from data_layer import DataSource
 import time
 import re
+import os
+import hashlib
 
 
 class TencentDataSource(DataSource):
@@ -22,10 +24,12 @@ class TencentDataSource(DataSource):
     - 实时行情: https://qt.gtimg.cn/q=...
     """
 
-    def __init__(self, max_retries: int = 3, delay: float = 0.3):
+    def __init__(self, max_retries: int = 3, delay: float = 0.3, cache_dir: str = './data_cache'):
         super().__init__()
         self.max_retries = max_retries
         self.delay = delay
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -36,10 +40,14 @@ class TencentDataSource(DataSource):
         self._industry_map = self._build_industry_mapping()
         self._industry_index_codes = self._build_industry_indices()
 
-        # 缓存
+        # 运行时缓存
         self._market_index_cache = None
         self._stock_data_cache = {}
         self._industry_index_cache = {}
+
+    def _cache_file(self, tencent_code: str, start: str, end: str) -> str:
+        """返回缓存文件路径"""
+        return os.path.join(self.cache_dir, f"{tencent_code}_{start}_{end}.csv")
 
     def _build_industry_mapping(self) -> Dict[str, str]:
         """构建股票-行业映射（扩展版，每行业至少8只）"""
@@ -193,14 +201,25 @@ class TencentDataSource(DataSource):
         return pd.DataFrame()
 
     def _fetch_multiple_klines(self, tencent_code: str, start: str, end: str) -> pd.DataFrame:
-        """分批获取K线（腾讯接口每次最多640条）"""
+        """分批获取K线（优先从缓存读取，缓存不存在时从接口获取并保存）"""
+        cache_file = self._cache_file(tencent_code, start, end)
+
+        # 尝试读取缓存
+        if os.path.exists(cache_file):
+            try:
+                df = pd.read_csv(cache_file, index_col='date', parse_dates=True)
+                if not df.empty:
+                    return df
+            except Exception:
+                pass  # 缓存损坏，重新下载
+
+        # 从接口获取
         start_dt = pd.to_datetime(start)
         end_dt = pd.to_datetime(end)
         all_dfs = []
         current_start = start_dt
 
         while current_start <= end_dt:
-            # 640个交易日大约覆盖2.5年
             chunk_end = current_start + timedelta(days=900)
             if chunk_end > end_dt:
                 chunk_end = end_dt
@@ -224,6 +243,14 @@ class TencentDataSource(DataSource):
 
         # 截取到目标范围
         combined = combined[(combined.index >= start_dt) & (combined.index <= end_dt)]
+
+        # 保存到缓存
+        if not combined.empty:
+            try:
+                combined.to_csv(cache_file)
+            except Exception as e:
+                print(f"缓存保存失败 {cache_file}: {e}")
+
         return combined
 
     def load_market_index(self, index_code: str = '000001', start: str = None, end: str = None) -> pd.DataFrame:
@@ -315,6 +342,16 @@ class TencentDataSource(DataSource):
         基于真实行情计算纯技术因子
         （腾讯接口无财务数据，用技术指标替代基本面因子）
         """
+        # 因子缓存：按日期缓存
+        cache_file = os.path.join(self.cache_dir, f"factors_{date}.csv")
+        if os.path.exists(cache_file):
+            try:
+                df = pd.read_csv(cache_file, index_col='code')
+                if not df.empty:
+                    return df
+            except Exception:
+                pass
+
         date_obj = pd.to_datetime(date)
         # 获取前120天数据用于计算因子
         start = (date_obj - timedelta(days=180)).strftime('%Y-%m-%d')
@@ -405,6 +442,13 @@ class TencentDataSource(DataSource):
 
         df = pd.DataFrame(records)
         df.set_index('code', inplace=True)
+
+        # 保存到缓存
+        try:
+            df.to_csv(cache_file)
+        except Exception as e:
+            print(f"因子缓存保存失败 {cache_file}: {e}")
+
         return df
 
     def load_industry_mapping(self, date: str) -> pd.Series:
